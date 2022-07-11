@@ -62,6 +62,7 @@
 
 #include "kernel_netlink_ipsec.h"
 #include "kernel_netlink_shared.h"
+#include "kernel_netlink_xfrmi.h"
 
 #include <daemon.h>
 #include <utils/debug.h>
@@ -340,6 +341,11 @@ struct private_kernel_netlink_ipsec_t {
 	 * Netlink xfrm socket (IPsec)
 	 */
 	netlink_socket_t *socket_xfrm;
+
+	/**
+	 * XFRM interface manager
+	 */
+	kernel_netlink_xfrmi_t *xfrmi;
 
 	/**
 	 * Netlink xfrm socket to receive acquire and expire events
@@ -3536,6 +3542,11 @@ METHOD(kernel_ipsec_t, destroy, void,
 		lib->watcher->remove(lib->watcher, this->socket_xfrm_events);
 		close(this->socket_xfrm_events);
 	}
+	if (this->xfrmi)
+	{
+		lib->set(lib, KERNEL_NETLINK_XFRMI_MANAGER, NULL);
+		kernel_netlink_xfrmi_destroy(this->xfrmi);
+	}
 	DESTROY_IF(this->socket_xfrm);
 	enumerator = this->policies->create_enumerator(this->policies);
 	while (enumerator->enumerate(enumerator, &policy, &policy))
@@ -3742,6 +3753,12 @@ kernel_netlink_ipsec_t *kernel_netlink_ipsec_create()
 		}
 		lib->watcher->add(lib->watcher, this->socket_xfrm_events, WATCHER_READ,
 						  (watcher_cb_t)receive_events, this);
+	}
+
+	this->xfrmi = kernel_netlink_xfrmi_create(TRUE);
+	if (this->xfrmi)
+	{
+		lib->set(lib, KERNEL_NETLINK_XFRMI_MANAGER, this->xfrmi);
 	}
 
 	netlink_find_offload_feature(lib->settings->get_str(lib->settings,
