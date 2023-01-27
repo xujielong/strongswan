@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2006-2022 Tobias Brunner
+ * Copyright (C) 2006-2023 Tobias Brunner
  * Copyright (C) 2005-2009 Martin Willi
  * Copyright (C) 2008-2016 Andreas Steffen
  * Copyright (C) 2006-2007 Fabian Hartmann, Noah Heusser
@@ -361,6 +361,26 @@ struct private_kernel_netlink_ipsec_t {
 	 * Installed port based IKE bypass policies, as bypass_t
 	 */
 	array_t *bypass;
+
+	/**
+	 * Interfaces that potentially support HW offloading, as offload_iface_t
+	 */
+	hashtable_t *offload_interfaces;
+
+	/**
+	 * Mutex to safely access the interfaces and bypasses
+	 */
+	mutex_t *offload_mutex;
+
+	/**
+	 * Netlink routing socket to receive link events
+	 */
+	netlink_event_socket_t *socket_link_events;
+
+	/**
+	 * (Potentially) offloaded IKE bypass policies, as bypass_t
+	 */
+	array_t *offload_bypass;
 
 	/**
 	 * Custom priority calculation function
@@ -1352,7 +1372,7 @@ static struct {
 /**
  * Check if kernel supports HW offload and determine feature flag
  */
-static void netlink_find_offload_feature(const char *ifname)
+static bool netlink_find_offload_feature(const char *ifname)
 {
 	struct ethtool_sset_info *sset_info;
 	struct ethtool_gstrings *cmd = NULL;
@@ -1364,7 +1384,7 @@ static void netlink_find_offload_feature(const char *ifname)
 	query_socket = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_XFRM);
 	if (query_socket < 0)
 	{
-		return;
+		return FALSE;
 	}
 
 	/* determine number of device features */
@@ -1416,10 +1436,11 @@ out:
 	free(sset_info);
 	free(cmd);
 	close(query_socket);
+	return netlink_hw_offload.supported;
 }
 
 /**
- * Check if interface supported HW offload
+ * Check if interface supports HW offload
  */
 static bool netlink_detect_offload(const char *ifname)
 {
@@ -1460,11 +1481,6 @@ static bool netlink_detect_offload(const char *ifname)
 			ret = TRUE;
 		}
 	}
-
-	if (!ret)
-	{
-		DBG1(DBG_KNL, "HW offload is not supported by device");
-	}
 	free(cmd);
 	close(query_socket);
 	return ret;
@@ -1472,8 +1488,9 @@ static bool netlink_detect_offload(const char *ifname)
 
 #else
 
-static void netlink_find_offload_feature(const char *ifname)
+static bool netlink_find_offload_feature(const char *ifname)
 {
+	return FALSE;
 }
 
 static bool netlink_detect_offload(const char *ifname)
@@ -1526,6 +1543,7 @@ static bool add_hw_offload(struct nlmsghdr *hdr, int buflen, host_t *local,
 	/* check if interface supports hw_offload */
 	if (!netlink_detect_offload(ifname))
 	{
+		DBG1(DBG_KNL, "HW offload is not supported by device");
 		goto out;
 	}
 
@@ -3425,6 +3443,44 @@ static bool add_socket_bypass(private_kernel_netlink_ipsec_t *this,
 }
 
 /**
+ * Keep track of interface and its offload support
+ */
+typedef struct {
+
+	/**
+	 * Interface index
+	 */
+	int ifindex;
+
+	/**
+	 * Name of the interface
+	 */
+	char ifname[IFNAMSIZ];
+
+	/**
+	 * Interface flags
+	 */
+	u_int flags;
+
+	/**
+	 * Offload state
+	 */
+	enum {
+		/** Offload support unknown */
+		IFACE_OFFLOAD_UNKNOWN,
+		/** No offload supported */
+		IFACE_OFFLOAD_NONE,
+		/** Interface supports at least crypto offload */
+		IFACE_OFFLOAD_DETECTED,
+		/** Interface supports crypto offload, but no packet and policy offload */
+		IFACE_OFFLOAD_CRYPTO,
+		/** Packet and policy offload supported */
+		IFACE_OFFLOAD_PACKET,
+	} offload;
+
+} offload_iface_t;
+
+/**
  * Port based IKE bypass policy
  */
 typedef struct {
@@ -3437,13 +3493,16 @@ typedef struct {
 } bypass_t;
 
 /**
- * Add or remove a bypass policy from/to kernel
+ * Add or remove a bypass policy from/to kernel. If an interface is given,
+ * the policy is tried to be offloaded to that interface.
  */
 static bool manage_bypass(private_kernel_netlink_ipsec_t *this,
-						  int type, policy_dir_t dir, bypass_t *bypass)
+						  int type, policy_dir_t dir, bypass_t *bypass,
+						  char *ifname)
 {
 	netlink_buf_t request;
 	struct xfrm_selector *sel;
+	struct xfrm_user_offload *offload = NULL;
 	struct nlmsghdr *hdr;
 
 	memset(&request, 0, sizeof(request));
@@ -3469,6 +3528,13 @@ static bool manage_bypass(private_kernel_netlink_ipsec_t *this,
 		policy->lft.hard_packet_limit = XFRM_INF;
 
 		sel = &policy->sel;
+
+		if (ifname &&
+			!add_hw_offload(hdr, sizeof(request), NULL, ifname,
+							HW_OFFLOAD_PACKET, &offload))
+		{
+			return FALSE;
+		}
 	}
 	else /* XFRM_MSG_DELPOLICY */
 	{
@@ -3494,14 +3560,139 @@ static bool manage_bypass(private_kernel_netlink_ipsec_t *this,
 		sel->sport = bypass->port;
 		sel->sport_mask = 0xffff;
 	}
+	if (ifname)
+	{
+		sel->ifindex = if_nametoindex(ifname);
+	}
 	return this->socket_xfrm->send_ack(this->socket_xfrm, hdr) == SUCCESS;
 }
 
 /**
- * Bypass socket using a port-based bypass policy
+ * Bypass socket using a port-based bypass policy, optionally offloaded to a
+ * given interface
  */
 static bool add_port_bypass(private_kernel_netlink_ipsec_t *this,
-							int fd, int family)
+							bypass_t *bypass, char *ifname)
+{
+	if (!manage_bypass(this, XFRM_MSG_NEWPOLICY, POLICY_IN, bypass, ifname))
+	{
+		return FALSE;
+	}
+	if (!manage_bypass(this, XFRM_MSG_NEWPOLICY, POLICY_OUT, bypass, ifname))
+	{
+		manage_bypass(this, XFRM_MSG_DELPOLICY, POLICY_IN, bypass, ifname);
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/**
+ * Offload the given port-based bypass policy to the given interface if possible.
+ *
+ * offload_mutex is assumed to be locked.
+ */
+static bool offload_bypass_iface(private_kernel_netlink_ipsec_t *this,
+								 bypass_t *bypass, offload_iface_t *iface)
+{
+	if ((iface->offload == IFACE_OFFLOAD_DETECTED ||
+		 iface->offload == IFACE_OFFLOAD_PACKET))
+	{
+		if (add_port_bypass(this, bypass, iface->ifname))
+		{
+			iface->offload = IFACE_OFFLOAD_PACKET;
+			return TRUE;
+		}
+		else if (iface->offload == IFACE_OFFLOAD_DETECTED)
+		{
+			iface->offload = IFACE_OFFLOAD_CRYPTO;
+		}
+	}
+	return FALSE;
+}
+
+/**
+ * Offload all known port-based bypass policies to the given interface.
+ *
+ * offload_mutex is assumed to be locked.
+ */
+static void offload_bypasses(private_kernel_netlink_ipsec_t *this,
+							 offload_iface_t *iface)
+{
+	enumerator_t *enumerator;
+	bypass_t *bypass;
+
+	enumerator = array_create_enumerator(this->offload_bypass);
+	while (enumerator->enumerate(enumerator, &bypass))
+	{
+		if (!offload_bypass_iface(this, bypass, iface))
+		{	/* interface does not support offloading */
+			break;
+		}
+	}
+	enumerator->destroy(enumerator);
+}
+
+/**
+ * Offload a new port-based bypass policy to all known interfaces
+ */
+static void offload_bypass(private_kernel_netlink_ipsec_t *this,
+						   bypass_t *bypass)
+{
+	enumerator_t *enumerator;
+	offload_iface_t *iface;
+
+	this->offload_mutex->lock(this->offload_mutex);
+	enumerator = this->offload_interfaces->create_enumerator(this->offload_interfaces);
+	while (enumerator->enumerate(enumerator, NULL, &iface))
+	{
+		if (iface->flags & IFF_UP)
+		{
+			offload_bypass_iface(this, bypass, iface);
+		}
+	}
+	enumerator->destroy(enumerator);
+	/* store it even if no policy was offloaded as an interface that supports
+	 * offloading might get activated later */
+	array_insert_create_value(&this->offload_bypass, sizeof(bypass_t),
+							  ARRAY_TAIL, bypass);
+	this->offload_mutex->unlock(this->offload_mutex);
+}
+
+CALLBACK(remove_port_bypass, void,
+	bypass_t *bypass, int idx, void *user)
+{
+	private_kernel_netlink_ipsec_t *this = user;
+
+	manage_bypass(this, XFRM_MSG_DELPOLICY, POLICY_OUT, bypass, NULL);
+	manage_bypass(this, XFRM_MSG_DELPOLICY, POLICY_IN, bypass, NULL);
+}
+
+CALLBACK(remove_offload_port_bypass, void,
+	bypass_t *bypass, int idx, void *user)
+{
+	private_kernel_netlink_ipsec_t *this = user;
+	enumerator_t *enumerator;
+	offload_iface_t *iface;
+
+	enumerator = this->offload_interfaces->create_enumerator(this->offload_interfaces);
+	while (enumerator->enumerate(enumerator, NULL, &iface))
+	{
+		if (iface->offload == IFACE_OFFLOAD_PACKET &&
+			iface->flags & IFF_UP)
+		{
+			manage_bypass(this, XFRM_MSG_DELPOLICY, POLICY_OUT, bypass,
+						  iface->ifname);
+			manage_bypass(this, XFRM_MSG_DELPOLICY, POLICY_IN, bypass,
+						  iface->ifname);
+		}
+	}
+	enumerator->destroy(enumerator);
+}
+
+/**
+ * Populate a bypass_t object for the given descriptor and address family
+ */
+static bool fill_bypass(int fd, int family, bypass_t *bypass)
 {
 	union {
 		struct sockaddr sa;
@@ -3509,65 +3700,62 @@ static bool add_port_bypass(private_kernel_netlink_ipsec_t *this,
 		struct sockaddr_in6 in6;
 	} saddr;
 	socklen_t len;
-	bypass_t bypass = {
+
+	*bypass = (bypass_t){
 		.family = family,
 	};
-
 	len = sizeof(saddr);
 	if (getsockname(fd, &saddr.sa, &len) != 0)
 	{
 		return FALSE;
 	}
 #ifdef SO_PROTOCOL /* since 2.6.32 */
-	len = sizeof(bypass.proto);
-	if (getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &bypass.proto, &len) != 0)
+	len = sizeof(bypass->proto);
+	if (getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &bypass->proto, &len) != 0)
 #endif
 	{	/* assume UDP if SO_PROTOCOL not supported */
-		bypass.proto = IPPROTO_UDP;
+		bypass->proto = IPPROTO_UDP;
 	}
 	switch (family)
 	{
 		case AF_INET:
-			bypass.port = saddr.in.sin_port;
+			bypass->port = saddr.in.sin_port;
 			break;
 		case AF_INET6:
-			bypass.port = saddr.in6.sin6_port;
+			bypass->port = saddr.in6.sin6_port;
 			break;
 		default:
 			return FALSE;
 	}
-
-	if (!manage_bypass(this, XFRM_MSG_NEWPOLICY, POLICY_IN, &bypass))
-	{
-		return FALSE;
-	}
-	if (!manage_bypass(this, XFRM_MSG_NEWPOLICY, POLICY_OUT, &bypass))
-	{
-		manage_bypass(this, XFRM_MSG_DELPOLICY, POLICY_IN, &bypass);
-		return FALSE;
-	}
-	array_insert(this->bypass, ARRAY_TAIL, &bypass);
-
 	return TRUE;
-}
-
-/**
- * Remove installed port based bypass policy
- */
-static void remove_port_bypass(bypass_t *bypass, int idx,
-							   private_kernel_netlink_ipsec_t *this)
-{
-	manage_bypass(this, XFRM_MSG_DELPOLICY, POLICY_OUT, bypass);
-	manage_bypass(this, XFRM_MSG_DELPOLICY, POLICY_IN, bypass);
 }
 
 METHOD(kernel_ipsec_t, bypass_socket, bool,
 	private_kernel_netlink_ipsec_t *this, int fd, int family)
 {
-	if (lib->settings->get_bool(lib->settings,
-					"%s.plugins.kernel-netlink.port_bypass", FALSE, lib->ns))
+	bypass_t bypass;
+	bool port_bypass;
+
+	port_bypass = lib->settings->get_bool(lib->settings,
+						"%s.plugins.kernel-netlink.port_bypass", FALSE, lib->ns);
+
+	if (this->offload_interfaces || port_bypass)
 	{
-		return add_port_bypass(this, fd, family);
+		fill_bypass(fd, family, &bypass);
+	}
+	if (this->offload_interfaces)
+	{
+		offload_bypass(this, &bypass);
+	}
+	if (port_bypass)
+	{
+		if (add_port_bypass(this, &bypass, NULL))
+		{
+			array_insert_create_value(&this->bypass, sizeof(bypass_t),
+									  ARRAY_TAIL, &bypass);
+			return TRUE;
+		}
+		return FALSE;
 	}
 	return add_socket_bypass(this, fd, family);
 }
@@ -3585,26 +3773,162 @@ METHOD(kernel_ipsec_t, enable_udp_decap, bool,
 	return TRUE;
 }
 
+CALLBACK(receive_link_events, void,
+	private_kernel_netlink_ipsec_t *this, struct nlmsghdr *hdr)
+{
+	struct ifinfomsg *msg = NLMSG_DATA(hdr);
+	struct rtattr *rta = IFLA_RTA(msg);
+	size_t rtasize = IFLA_PAYLOAD (hdr);
+	offload_iface_t *iface = NULL;
+	char *name = NULL;
+
+	if (hdr->nlmsg_type != RTM_NEWLINK &&
+		hdr->nlmsg_type != RTM_DELLINK)
+	{
+		return;
+	}
+
+	while (RTA_OK(rta, rtasize))
+	{
+		switch (rta->rta_type)
+		{
+			case IFLA_IFNAME:
+				name = RTA_DATA(rta);
+				break;
+		}
+		rta = RTA_NEXT(rta, rtasize);
+	}
+	if (!name)
+	{
+		return;
+	}
+
+	this->offload_mutex->lock(this->offload_mutex);
+	if (hdr->nlmsg_type == RTM_NEWLINK)
+	{
+		iface = this->offload_interfaces->get(this->offload_interfaces,
+											  (void*)(uintptr_t)msg->ifi_index);
+		if (!iface)
+		{
+			INIT(iface,
+				.ifindex = msg->ifi_index
+			);
+			this->offload_interfaces->put(this->offload_interfaces,
+										  (void*)(uintptr_t)msg->ifi_index,
+										  iface);
+		}
+		/* update name if case an interface is renamed */
+		strncpy(iface->ifname, name, IFNAMSIZ-1);
+		iface->ifname[IFNAMSIZ-1] = '\0';
+
+		if (iface->offload == IFACE_OFFLOAD_UNKNOWN)
+		{
+			if (netlink_detect_offload(iface->ifname))
+			{
+				iface->offload = IFACE_OFFLOAD_DETECTED;
+			}
+			else
+			{
+				iface->offload = IFACE_OFFLOAD_NONE;
+			}
+		}
+
+		/* if an interface is activated or newly detected, try to offload known
+		 * IKE bypass policies */
+		if (!(iface->flags & IFF_UP) && (msg->ifi_flags & IFF_UP))
+		{
+			offload_bypasses(this, iface);
+		}
+		iface->flags = msg->ifi_flags;
+	}
+	else
+	{
+		iface = this->offload_interfaces->remove(this->offload_interfaces,
+												 (void*)(uintptr_t)msg->ifi_index);
+		free(iface);
+	}
+	this->offload_mutex->unlock(this->offload_mutex);
+}
+
+/**
+ * Enumerate all interfaces and check if they support offloading
+ */
+static bool init_offload_interfaces(private_kernel_netlink_ipsec_t *this)
+{
+	netlink_buf_t request;
+	netlink_socket_t *socket;
+	struct nlmsghdr *out, *current, *in;
+	struct rtgenmsg *msg;
+	size_t len;
+
+	socket = netlink_socket_create(NETLINK_ROUTE, NULL, FALSE);
+	if (!socket)
+	{
+		return FALSE;
+	}
+
+	memset(&request, 0, sizeof(request));
+
+	in = &request.hdr;
+	in->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	in->nlmsg_type = RTM_GETLINK;
+	in->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtgenmsg));
+
+	msg = NLMSG_DATA(in);
+	msg->rtgen_family = AF_UNSPEC;
+
+	if (socket->send(socket, in, &out, &len) != SUCCESS)
+	{
+		socket->destroy(socket);
+		return FALSE;
+	}
+
+	current = out;
+	while (NLMSG_OK(current, len))
+	{
+		receive_link_events(this, current);
+		current = NLMSG_NEXT(current, len);
+	}
+	free(out);
+	socket->destroy(socket);
+	return TRUE;
+}
+
 METHOD(kernel_ipsec_t, destroy, void,
 	private_kernel_netlink_ipsec_t *this)
 {
 	enumerator_t *enumerator;
 	policy_entry_t *policy;
+	offload_iface_t *iface;
 
 	array_destroy_function(this->bypass,
-						   (array_callback_t)remove_port_bypass, this);
+						   remove_port_bypass, this);
+	array_destroy_function(this->offload_bypass,
+						   remove_offload_port_bypass, this);
+	DESTROY_IF(this->socket_link_events);
 	DESTROY_IF(this->socket_xfrm_events);
 	DESTROY_IF(this->socket_xfrm);
 	enumerator = this->policies->create_enumerator(this->policies);
-	while (enumerator->enumerate(enumerator, &policy, &policy))
+	while (enumerator->enumerate(enumerator, NULL, &policy))
 	{
 		policy_entry_destroy(this, policy);
 	}
 	enumerator->destroy(enumerator);
 	this->policies->destroy(this->policies);
+	if (this->offload_interfaces)
+	{
+		enumerator = this->offload_interfaces->create_enumerator(this->offload_interfaces);
+		while (enumerator->enumerate(enumerator, NULL, &iface))
+		{
+			free(iface);
+		}
+		enumerator->destroy(enumerator);
+		this->offload_interfaces->destroy(this->offload_interfaces);
+	}
 	this->sas->destroy(this->sas);
 	this->condvar->destroy(this->condvar);
 	this->mutex->destroy(this->mutex);
+	DESTROY_IF(this->offload_mutex);
 	free(this);
 }
 
@@ -3742,7 +4066,6 @@ kernel_netlink_ipsec_t *kernel_netlink_ipsec_create()
 									 (hashtable_equals_t)policy_equals, 32),
 		.sas = hashtable_create((hashtable_hash_t)ipsec_sa_hash,
 								(hashtable_equals_t)ipsec_sa_equals, 32),
-		.bypass = array_create(sizeof(bypass_t), 0),
 		.mutex = mutex_create(MUTEX_TYPE_DEFAULT),
 		.condvar = condvar_create(CONDVAR_TYPE_DEFAULT),
 		.get_priority = dlsym(RTLD_DEFAULT,
@@ -3778,9 +4101,22 @@ kernel_netlink_ipsec_t *kernel_netlink_ipsec_create()
 		return NULL;
 	}
 
-	netlink_find_offload_feature(lib->settings->get_str(lib->settings,
+	if (netlink_find_offload_feature(lib->settings->get_str(lib->settings,
 					"%s.plugins.kernel-netlink.hw_offload_feature_interface",
-					"lo", lib->ns));
-
+					"lo", lib->ns)))
+	{
+		this->offload_interfaces = hashtable_create(hashtable_hash_ptr,
+													hashtable_equals_ptr, 8);
+		this->offload_mutex = mutex_create(MUTEX_TYPE_DEFAULT);
+		this->socket_link_events = netlink_event_socket_create(NETLINK_ROUTE,
+													nl_group(RTNLGRP_LINK),
+													receive_link_events, this);
+		if (!this->socket_link_events ||
+			!init_offload_interfaces(this))
+		{
+			destroy(this);
+			return NULL;
+		}
+	}
 	return &this->public;
 }
